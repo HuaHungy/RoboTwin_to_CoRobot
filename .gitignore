@@ -1,0 +1,25 @@
+
+# Data & Datasets
+Cobot_Magic_pour_water_bottle/
+RoboTwin_dataset/
+RoboTwin_converted/
+RoboTwin_restored/
+
+# Temporary & Output Directories
+test_output_corobot/
+test_output_robotwin_restored/
+__pycache__/
+
+# System & IDE files
+.DS_Store
+.vscode/
+*.pyc
+
+# Environment (if stored locally, though we used conda)
+venv/
+env/
+.env
+
+# Large Files / Other
+*.parquet
+*.mp4
