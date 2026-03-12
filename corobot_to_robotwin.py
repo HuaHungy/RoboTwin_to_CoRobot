@@ -13,6 +13,27 @@ import json
 import shutil
 from tqdm import tqdm
 
+# Standard RoboTwin columns in order
+ROBOTWIN_COLUMNS = [
+    'observation.state',
+    'action',
+    'observation.images.cam_high',
+    'observation.images.cam_left_wrist',
+    'observation.images.cam_right_wrist',
+    'timestamp',
+    'frame_index',
+    'episode_index',
+    'index',
+    'task_index'
+]
+
+# Mapping from source video column (in info.json or folder name) to target parquet column
+IMAGE_COLS_MAP = {
+    'observation.images.cam_high_rgb': 'observation.images.cam_high',
+    'observation.images.cam_left_wrist_rgb': 'observation.images.cam_left_wrist',
+    'observation.images.cam_right_wrist_rgb': 'observation.images.cam_right_wrist'
+}
+
 def process_episode(source_parquet_path, source_video_base, target_data_dir, episode_name):
     # Read source parquet (state only)
     try:
@@ -21,16 +42,8 @@ def process_episode(source_parquet_path, source_video_base, target_data_dir, epi
         print(f"Error reading {source_parquet_path}: {e}")
         return
 
-    # Define mapping from Source Video Folder -> Target Parquet Column
-    # Source has _rgb, Target (RoboTwin) does not
-    image_cols_map = {
-        'observation.images.cam_high_rgb': 'observation.images.cam_high',
-        'observation.images.cam_left_wrist_rgb': 'observation.images.cam_left_wrist',
-        'observation.images.cam_right_wrist_rgb': 'observation.images.cam_right_wrist'
-    }
-
     # Iterate over cameras
-    for source_vid_col, target_col in image_cols_map.items():
+    for source_vid_col, target_col in IMAGE_COLS_MAP.items():
         # Construct video path
         # videos/chunk-000/observation.images.cam_high_rgb/episode_000000.mp4
         video_path = os.path.join(source_video_base, source_vid_col, episode_name.replace('.parquet', '.mp4'))
@@ -73,10 +86,63 @@ def process_episode(source_parquet_path, source_video_base, target_data_dir, epi
             print(f"Error reading video {video_path}: {e}")
             df[target_col] = None
 
+    # Filter and reorder columns
+    final_cols = []
+    for col in ROBOTWIN_COLUMNS:
+        if col in df.columns:
+            final_cols.append(col)
+        else:
+            print(f"Warning: Missing column {col} in {episode_name}")
+            # Optional: Add missing column with default values if critical?
+            # For now, we skip it but this might cause schema issues if inconsistent across files.
+            # If standard requires it, we should probably add it.
+            if col == 'index':
+                 df[col] = df.index
+                 final_cols.append(col)
+            elif col == 'task_index':
+                 # Default to 0 if missing
+                 df[col] = 0
+                 final_cols.append(col)
+            else:
+                 pass # Skip other missing columns
+
+    # Select only the relevant columns
+    df_final = df[final_cols]
+
+    # Detect dimensions for schema
+    if len(df_final) > 0:
+        state_dim = len(df_final['observation.state'].iloc[0]) if 'observation.state' in df_final.columns else 0
+        action_dim = len(df_final['action'].iloc[0]) if 'action' in df_final.columns else 0
+    else:
+        state_dim = 0
+        action_dim = 0
+    
+    # Define PyArrow schema to enforce fixed_size_list and specific struct for images
+    fields = []
+    # Only include columns that are actually in df_final
+    for col in df_final.columns:
+        if col == 'observation.state':
+            fields.append((col, pa.list_(pa.float32(), state_dim)))
+        elif col == 'action':
+            fields.append((col, pa.list_(pa.float32(), action_dim)))
+        elif col.startswith('observation.images.'):
+            fields.append((col, pa.struct([
+                ('bytes', pa.binary()),
+                ('path', pa.string())
+            ])))
+        elif col == 'timestamp':
+            fields.append((col, pa.float32()))
+        elif col in ['frame_index', 'episode_index', 'index', 'task_index']:
+            fields.append((col, pa.int64()))
+            
+    schema = pa.schema(fields)
+
+    # Convert to PyArrow Table with schema
+    table = pa.Table.from_pandas(df_final, schema=schema, preserve_index=False)
+
     # Save target parquet
     target_parquet_path = os.path.join(target_data_dir, episode_name)
-    # PyArrow should handle the struct conversion automatically from list of dicts
-    df.to_parquet(target_parquet_path, index=False)
+    pq.write_table(table, target_parquet_path)
 
 def convert_corobot_to_robotwin(source_dir, target_dir):
     print(f"Converting CoRobot -> RoboTwin")
@@ -139,30 +205,35 @@ def convert_corobot_to_robotwin(source_dir, target_dir):
             shutil.copy2(s, d)
 
     # Copy/Generate metadata
-    # We'll try to read source info.json and modify it, or create new
     source_info_path = os.path.join(source_dir, 'meta', 'info.json')
     if os.path.exists(source_info_path):
         with open(source_info_path, 'r') as f:
             info = json.load(f)
         
-        # Modify features back to struct
-        # Note: This is a simplification. The full schema is complex.
-        # But for RoboTwin compatibility, we might just want to remove the "dtype: video" part
-        # and revert to implicit struct inference or specify it.
-        # For now, let's keep it simple or just copy basic fields.
+        # Filter features to only keep ROBOTWIN_COLUMNS
+        new_features = {}
+        
         if "features" in info:
-            for key in ['observation.images.cam_high_rgb', 'observation.images.cam_left_wrist_rgb', 'observation.images.cam_right_wrist_rgb']:
-                if key in info['features']:
-                    # Remove the RGB key and add the non-RGB key with struct info?
-                    # Or just leave it for the user to fix. 
-                    # Given the task, I should probably try to fix it.
-                    new_key = key.replace('_rgb', '')
-                    info['features'][new_key] = {
-                        "dtype": "struct", # Not standard LeRobot but descriptive
-                        "shape": [], 
-                        "names": ["bytes", "path"]
-                    }
-                    del info['features'][key]
+            # First, handle non-image columns
+            for col in ROBOTWIN_COLUMNS:
+                if col in info['features']:
+                    new_features[col] = info['features'][col]
+                
+                # Check mapping for image columns
+                # Iterate through map to find if 'col' is a target
+                for src_key, tgt_key in IMAGE_COLS_MAP.items():
+                    if tgt_key == col and src_key in info['features']:
+                        # Create new image feature definition matching RoboTwin standard
+                        # Standard RoboTwin uses dtype: image, shape: [3, 480, 640], names: [channels, height, width]
+                        new_features[col] = {
+                            "dtype": "image",
+                            "shape": [3, 480, 640],
+                            "names": ["channels", "height", "width"]
+                        }
+                        # We do NOT copy the video info as it is now struct of images
+                        break
+        
+        info['features'] = new_features
         
         with open(os.path.join(target_meta_dir, 'info.json'), 'w') as f:
             json.dump(info, f, indent=4)
