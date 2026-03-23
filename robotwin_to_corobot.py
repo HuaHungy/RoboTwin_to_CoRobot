@@ -53,9 +53,9 @@ def process_episode(source_path, target_data_dir, target_video_base, episode_nam
                 print(f"Unexpected data type in {source_col}: {type(item)}")
                 return
 
-        # Write video
+        # Write video using lossless encoding to ensure zero pixel difference
         video_path = os.path.join(target_video_base, target_col, episode_name.replace('.parquet', '.mp4'))
-        imageio.mimwrite(video_path, frames, fps=30, codec='libx264', quality=8)
+        imageio.mimwrite(video_path, frames, fps=30, codec='libx264rgb', ffmpeg_params=['-crf', '0'])
 
     # Create target dataframe (drop image columns)
     df_target = df.drop(columns=list(image_cols.keys()))
